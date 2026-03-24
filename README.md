@@ -1,6 +1,5 @@
- =============================================================================
- HOW SESSION RECOVERY WORKS
- =============================================================================
+# HOW SESSION RECOVERY WORKS
+
 
  1. SESSION IDENTIFICATION:
     The script retrieves all sessions via `opencode session list --format json`.
