@@ -48,11 +48,14 @@ cd ~ 2>/dev/null || cd /home/primary
 set -uo pipefail
 
 # Configuration
-SCRIPT_VERSION="1.1.0"
-DEFAULT_TIME_CLUSTER_THRESHOLD=300  # 5 minutes to identify crash clusters
+SCRIPT_VERSION="1.1.1"
+DEFAULT_TIME_CLUSTER_THRESHOLD=900  # seconds to identify crash clusters (default: 15 min, increased for better detection)
+TIME_CLUSTER_THRESHOLD=$DEFAULT_TIME_CLUSTER_THRESHOLD
 DEFAULT_MAX_SESSIONS=15
 DEFAULT_LAUNCH_DELAY=1.5  # seconds between launching sessions
+DEFAULT_INITIAL_DELAY=2  # seconds to wait before first launch (allows terminal to initialize)
 LOG_FILE="/tmp/opencode_recovery.log"
+DEBUG_LOG_FILE="/tmp/opencode_recovery_debug.log"
 TEMP_DIR="/tmp/opencode_recovery"
 
 # Check bash version (pipefail requires bash 3+)
@@ -89,6 +92,8 @@ INTERACTIVE=false
 VERBOSE=false
 MAX_SESSIONS=$DEFAULT_MAX_SESSIONS
 LAUNCH_DELAY=$DEFAULT_LAUNCH_DELAY
+INITIAL_DELAY=$DEFAULT_INITIAL_DELAY
+TIME_CLUSTER_THRESHOLD=$DEFAULT_TIME_CLUSTER_THRESHOLD
 MODE="recover"
 
 # Logging function
@@ -98,6 +103,18 @@ log() {
     local message="$*"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+    if [[ "$VERBOSE" == true ]]; then
+        echo "[$timestamp] [$level] $message" >> "$DEBUG_LOG_FILE"
+    fi
+}
+
+# Debug-only logging (separate file when not verbose, combined when verbose)
+debug_log() {
+    local level=$1
+    shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" >> "$DEBUG_LOG_FILE"
 }
 
 info() { log "INFO" "$@"; }
@@ -272,7 +289,7 @@ timestamp_to_human() {
 find_crash_clusters() {
     local session_data="$1"
     local current_time=$(current_timestamp_ms)
-    local threshold=${2:-$DEFAULT_TIME_CLUSTER_THRESHOLD}
+    local threshold=${2:-$TIME_CLUSTER_THRESHOLD}
     
     # Get currently running sessions to exclude from crash detection
     local running_sessions_file="$TEMP_DIR/running_sessions"
@@ -345,9 +362,9 @@ find_crash_clusters() {
                     # Format: size_START_END_sessionList
                     local start_timestamp=${cluster_timestamps[0]}
                     local end_timestamp=${cluster_timestamps[-1]}
-                    # Replace spaces with underscores to avoid parsing issues
-                    local start_human=$(timestamp_to_human "$start_timestamp" | tr ' ' '_')
-                    local end_human=$(timestamp_to_human "$end_timestamp" | tr ' ' '_')
+                    # Use bracket format for timestamps - brackets won't conflict with session IDs during parsing
+                    local start_human="[$(timestamp_to_human "$start_timestamp" | tr ' ' '-')]"
+                    local end_human="[$(timestamp_to_human "$end_timestamp" | tr ' ' '-')]"
                     local session_list=$(printf '%s,' "${cluster_sessions[@]}" | sed 's/,$//')
                     clusters+=("${#cluster_sessions[@]}_${start_human}_${end_human}_${session_list}")
                 fi
@@ -707,13 +724,24 @@ recover_sessions() {
     print_status "Recovering most recent crash cluster ($recovery_count sessions)..."
     local success_count=0
     local fail_count=0
+    local is_first=true
     
     for session_id in "${sessions_to_recover[@]}"; do
         if [[ "$DRY_RUN" == true ]]; then
             print_info "[DRY RUN] Would recover session: $session_id"
+            debug_log "DEBUG" "Dry run: session $session_id"
             ((success_count++))
         else
+            # Initial delay before first launch to let terminal fully initialize
+            if [[ "$is_first" == true ]]; then
+                debug_log "DEBUG" "Initial delay before first session launch: $INITIAL_DELAY seconds"
+                sleep $INITIAL_DELAY
+                is_first=false
+            fi
+            
+            debug_log "DEBUG" "Attempting to recover session: $session_id"
             print_info "Recovering session: $session_id"
+            
             # Launch session in a new visible terminal
             local launch_success=false
             
@@ -772,6 +800,7 @@ show_usage() {
     echo "  --verbose, -v    Enable verbose output"
     echo "  --max-sessions N Limit number of sessions to recover (default: $DEFAULT_MAX_SESSIONS)"
     echo "  --delay N        Delay between launching sessions in seconds (default: $DEFAULT_LAUNCH_DELAY)"
+    echo "  --threshold N    Cluster threshold in seconds (default: $DEFAULT_TIME_CLUSTER_THRESHOLD, currently ${TIME_CLUSTER_THRESHOLD}s)"
     echo "  --help, -h       Show this help message"
     echo "  --version        Show version information"
     echo
@@ -823,6 +852,14 @@ parse_args() {
                 LAUNCH_DELAY="$2"
                 if ! [[ "$LAUNCH_DELAY" =~ ^[0-9]+\.?[0-9]*$ ]]; then
                     print_error "Invalid delay value: $LAUNCH_DELAY"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --threshold)
+                TIME_CLUSTER_THRESHOLD="$2"
+                if ! [[ "$TIME_CLUSTER_THRESHOLD" =~ ^[0-9]+$ ]]; then
+                    print_error "Invalid threshold value: $TIME_CLUSTER_THRESHOLD (must be seconds)"
                     exit 1
                 fi
                 shift 2
@@ -937,11 +974,12 @@ interactive_mode() {
         echo "3) View all crash clusters - See details of all detected crash clusters"
         echo "4) Interactive cluster selection - Choose which crash cluster to recover"
         echo "5) Restore any session - List all recoverable sessions (newest first) and pick one"
-        echo "6) Exit"
+        echo "6) Configure settings - Change cluster threshold or other settings"
+        echo "7) Exit"
         echo "i) About - Learn how the crash detection and recovery algorithm works"
         echo
         local choice
-        read -p "Please select an option (1-6 or i for info): " -r choice
+        read -p "Please select an option (1-7 or i for info): " -r choice
         
         case $choice in
             1)
@@ -1137,9 +1175,18 @@ interactive_mode() {
                             local recovery_count=0
                             local fail_count=0
                             
-                            print_info "Recovering selected cluster (${#selected_sessions[@]} sessions)..."
-                            
+print_info "Recovering selected cluster (${#selected_sessions[@]} sessions)..."
+
+                            local recovery_is_first=true
                             for session_id in "${selected_sessions[@]}"; do
+                                # Initial delay before first launch
+                                if [[ "$recovery_is_first" == true ]]; then
+                                    debug_log "DEBUG" "Initial delay before first session (cluster selection): $INITIAL_DELAY seconds"
+                                    sleep $INITIAL_DELAY
+                                    recovery_is_first=false
+                                fi
+                                
+                                debug_log "DEBUG" "Recovering session via cluster selection: $session_id"
                                 print_info "Recovering session: $session_id"
                                 local launch_success=false
                                 
@@ -1293,7 +1340,12 @@ interactive_mode() {
                     echo
                     read -p "Recover session $selected_id? (y/N): " -r confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                        # Initial delay before launch (single session recovery)
+                        debug_log "DEBUG" "Initial delay before single session launch: $INITIAL_DELAY seconds"
+                        sleep $INITIAL_DELAY
+                        
                         # Launch the selected session
+                        debug_log "DEBUG" "Recovering single session: $selected_id"
                         print_info "Recovering session: $selected_id"
                         local launch_success=false
                         if command -v gnome-terminal >/dev/null 2>&1; then
@@ -1324,7 +1376,48 @@ interactive_mode() {
                 echo
                 read -p "Press Enter to continue..."
                 ;;
-            6|"")
+            6)
+                echo
+                print_status "Configure Settings"
+                echo "========================"
+                echo "Current cluster threshold: $((TIME_CLUSTER_THRESHOLD / 60)) minutes ($TIME_CLUSTER_THRESHOLD seconds)"
+                echo
+                echo "1) Change cluster threshold (currently $((TIME_CLUSTER_THRESHOLD / 60)) min)"
+                echo "2) Show current settings summary"
+                echo "3) Return to main menu"
+                echo
+                local config_choice
+                read -p "Select option (1-3): " -r config_choice
+                
+                case $config_choice in
+                    1)
+                        echo
+                        read -p "Enter new cluster threshold in minutes: " -r new_minutes
+                        if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ $new_minutes -gt 0 ]]; then
+                            TIME_CLUSTER_THRESHOLD=$((new_minutes * 60))
+                            print_success "Cluster threshold set to $new_minutes minutes ($TIME_CLUSTER_THRESHOLD seconds)"
+                            debug_log "DEBUG" "Cluster threshold changed to $new_minutes minutes"
+                        else
+                            print_warning "Invalid value. Using current: $((TIME_CLUSTER_THRESHOLD / 60)) minutes"
+                        fi
+                        ;;
+                    2)
+                        echo
+                        print_info "Current Settings:"
+                        echo "  Cluster threshold: $((TIME_CLUSTER_THRESHOLD / 60)) minutes ($TIME_CLUSTER_THRESHOLD seconds)"
+                        echo "  Max sessions: $MAX_SESSIONS"
+                        echo "  Launch delay: ${LAUNCH_DELAY}s"
+                        echo "  Initial delay: ${INITIAL_DELAY}s"
+                        echo "  Default threshold: $((DEFAULT_TIME_CLUSTER_THRESHOLD / 60)) minutes"
+                        ;;
+                    *)
+                        print_info "Returning to main menu."
+                        ;;
+                esac
+                echo
+                read -p "Press Enter to continue..."
+                ;;
+            7|"")
                 echo
                 print_info "Exiting..."
                 return 0
